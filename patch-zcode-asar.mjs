@@ -193,7 +193,9 @@ function writeAsar(src, newHeader, plan, tmpOut) {
       let read = 0;
       while (read < e.size) {
         const want = Math.min(chunk.length, e.size - read);
-        const r = fs.readSync(src.fd, chunk, 0, want, src.base + e.origOffset);
+        // position must advance with `read`: entries larger than the chunk were
+        // silently corrupted (first 4 MB re-copied over the tail) without it.
+        const r = fs.readSync(src.fd, chunk, 0, want, src.base + e.origOffset + read);
         if (r <= 0) throw new Error("short read for " + e.path);
         let w2 = 0;
         while (w2 < r) w2 += fs.writeSync(out, chunk, w2, r - w2, pos + read + w2);
@@ -305,15 +307,37 @@ function main() {
     console.log("Writing patched archive (" + (plan.reduce((a, e) => a + e.size, 0) / 1048576).toFixed(0) + " MB data)...");
     writeAsar(src, newHeader, plan, tmp);
 
-    // verify the new archive parses and the patched files are readable
+    // Verify the new archive: parse header, byte-compare EVERY entry (patched ones
+    // against their in-memory buffers, copied ones against the source archive).
+    // A repack that silently mangles a large entry (past the stream chunk size)
+    // must fail here, not hang ZCode at the splash screen days later.
+    console.log("Verifying repacked archive (byte-comparing all " + plan.length + " entries)...");
     const check = openAsar(tmp);
     try {
-      for (const p of patched.keys()) {
-        const e = check.entries.find(x => x.path === p);
-        if (!e) throw new Error("patched entry missing in new archive: " + p);
-        const b = Buffer.alloc(e.node.size);
-        check.readFully(b, e.node.size, check.base + parseInt(e.node.offset, 10));
-        if (!b.equals(patched.get(p))) throw new Error("round-trip mismatch for " + p);
+      const byPath = new Map(check.entries.map(x => [x.path, x]));
+      const ca = Buffer.alloc(1 << 22), cb = Buffer.alloc(1 << 22);
+      for (const e of plan) {
+        const np = byPath.get(e.path);
+        if (!np) throw new Error("entry missing in new archive: " + e.path);
+        const nOff = parseInt(np.node.offset, 10);
+        if (e.buf) {
+          if (np.node.size !== e.buf.length) throw new Error("size mismatch for " + e.path);
+          const b = Buffer.alloc(e.buf.length);
+          check.readFully(b, e.buf.length, check.base + nOff);
+          if (!b.equals(e.buf)) throw new Error("round-trip mismatch for " + e.path);
+          continue;
+        }
+        if (np.node.size !== e.size) throw new Error("size mismatch for copied entry " + e.path);
+        let read = 0;
+        while (read < e.size) {
+          const want = Math.min(ca.length, e.size - read);
+          const ra = fs.readSync(src.fd, ca, 0, want, src.base + e.origOffset + read);
+          const rb = fs.readSync(check.fd, cb, 0, want, check.base + nOff + read);
+          if (ra <= 0 || rb !== ra || !ca.subarray(0, ra).equals(cb.subarray(0, ra))) {
+            throw new Error("byte-verify mismatch for copied entry " + e.path + " at +" + read);
+          }
+          read += ra;
+        }
       }
     } finally { check.close(); }
 
