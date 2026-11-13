@@ -334,20 +334,26 @@ function createProvider(ctx, mod) {
     async acknowledgeCallback(bot, raw, text, reply, signal) {
       // The quick ack on INTERACTION_CREATE deferred the interaction; now that
       // the answer has been delivered as a channel message, edit the ephemeral
-      // "thinking" placeholder to blank so it disappears. The deferred response
-      // is edited via PATCH /webhooks/{app}/{interaction}/{token}/messages/@original
-      // (top-level content/components). If quickAck did not run (e.g. the very
-      // first interaction raced the READY event), defer via the callback
-      // endpoint as a fallback.
+      // "thinking" placeholder to blank so it disappears. Interaction webhook
+      // routes are TWO segments — /webhooks/{application_id}/{interaction_token}
+      // — the token itself encodes the interaction id; adding an id segment
+      // 404s. The host aborts its own `signal` on a 3s ack budget, but this is
+      // best-effort cleanup after the reply already landed, so use a fresh
+      // short-lived signal instead of inheriting a stale abort.
       const d = raw?.update?.kind === "interaction" ? raw.update.data : null;
       if (!d?.token || !d?.id) return;
       const t = await tokenOf(bot);
       const id = String(d.id);
       const already = mod.ackedInteractions?.has(id);
       mod.ackedInteractions?.delete(id);
+      const own = AbortSignal.timeout(4000);
       if (!already) {
-        await rest(t, "POST", `/interactions/${id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } }, signal)
-          .catch(e => log(ctx, `fallback defer failed id=${id}: ${e?.message || e}`));
+        await rest(t, "POST", `/interactions/${id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } }, own)
+          .catch(e => {
+            const m = String(e?.message || e);
+            // "Unknown interaction" = quickAck already deferred this one (race).
+            if (!m.includes("Unknown interaction")) log(ctx, `fallback defer failed id=${id}: ${m}`);
+          });
       }
       let appId = mod.appIds?.[bot.id];
       if (!appId) {
@@ -355,7 +361,7 @@ function createProvider(ctx, mod) {
         if (app?.id) { appId = String(app.id); (mod.appIds ||= {})[bot.id] = appId; }
       }
       if (!appId) return;
-      await rest(t, "PATCH", `/webhooks/${appId}/${id}/${d.token}/messages/@original`, { content: "\u200b", components: [], flags: 64 }, signal)
+      await rest(t, "PATCH", `/webhooks/${appId}/${d.token}/messages/@original`, { content: "\u200b", components: [], flags: 64 }, own)
         .catch(e => log(ctx, `placeholder clear failed id=${id}: ${e?.message || e}`));
     },
     async downloadAttachment() { return null; },
@@ -481,10 +487,16 @@ function connectGateway(ctx, mod, bot, token) {
   // alongside the EPHEMERAL flag.
   async function quickAck(d) {
     if (!d || !d.id || !d.token) return;
+    const k = String(d.id);
+    // mark optimistically so a very fast acknowledgeCallback cannot double-defer;
+    // removed again when the defer actually fails.
+    (mod.ackedInteractions ||= new Map()).set(k, Date.now());
     try {
       await rest(token, "POST", `/interactions/${d.id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } });
-      (mod.ackedInteractions ||= new Map()).set(String(d.id), Date.now());
-    } catch (e) { log(ctx, `quickAck defer failed id=${d.id}: ${e?.message || e} — slow commands may show "did not respond"`); }
+    } catch (e) {
+      mod.ackedInteractions?.delete(k);
+      log(ctx, `quickAck defer failed id=${d.id}: ${e?.message || e} — slow commands may show "did not respond"`);
+    }
   }
 
   async function welcomeLoop(who) {
