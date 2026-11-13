@@ -396,7 +396,10 @@ function createProvider(ctx, mod) {
         const d = u.data;
         if (!d) return [];
         let text = "";
-        if (d.type === 1) {
+        // Discord INTERACTION_CREATE types: 1=PING (never delivered to bots),
+        // 2=ApplicationCommand, 3=MessageComponent (data.component_type:
+        // 2=button, 3=string-select), 4=Autocomplete, 5=Modal.
+        if (d.type === 2) {
           // Slash command from Discord's UI -> rebuild the textual command the
           // host's splitCommand parser expects ("/bind <code>", "/model", …).
           const name = typeof d.data?.name === "string" ? d.data.name : "";
@@ -407,11 +410,11 @@ function createProvider(ctx, mod) {
               (typeof o?.boolean_value === "boolean" ? String(o.boolean_value) : o?.value);
             if (v !== undefined && v !== null && v !== "") text += " " + String(v);
           }
-        } else if (d.type === 2 && d.data?.component_type === 2) {
+        } else if (d.type === 3 && d.data?.component_type === 2) {
           const cid = typeof d.data.custom_id === "string" ? d.data.custom_id : "";
           if (!cid.startsWith("zc:")) return [];
           text = decodeCb(cid);
-        } else if (d.type === 2 && d.data?.component_type === 3) {
+        } else if (d.type === 3 && d.data?.component_type === 3) {
           // Select menu pick -> the chosen option's value carries the zc:* id.
           const cid = Array.isArray(d.data.values) && d.data.values.length ? String(d.data.values[0]) : "";
           if (!cid.startsWith("zc:")) return [];
@@ -419,6 +422,7 @@ function createProvider(ctx, mod) {
         } else {
           return [];
         }
+        log(ctx, `interaction decoded id=${d.id} -> "${text}"`);
         const user = d.user || d.member?.user;
         const userId = user?.id != null ? String(user.id) : "";
         if (!userId) return [];
