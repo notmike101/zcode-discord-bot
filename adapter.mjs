@@ -332,20 +332,31 @@ function createProvider(ctx, mod) {
       await rest(t, "POST", `/channels/${channelId}/typing`, {}).catch(() => {});
     },
     async acknowledgeCallback(bot, raw, text, reply, signal) {
-      // The quick ack on INTERACTION_CREATE already deferred; now clear the
-      // "is thinking" state now that the answer is (being) delivered. Fall back
-      // to deferring here if the quick ack could not run (e.g. app id unknown).
+      // The quick ack on INTERACTION_CREATE deferred the interaction; now that
+      // the answer has been delivered as a channel message, edit the ephemeral
+      // "thinking" placeholder to blank so it disappears. The deferred response
+      // is edited via PATCH /webhooks/{app}/{interaction}/{token}/messages/@original
+      // (top-level content/components). If quickAck did not run (e.g. the very
+      // first interaction raced the READY event), defer via the callback
+      // endpoint as a fallback.
       const d = raw?.update?.kind === "interaction" ? raw.update.data : null;
       if (!d?.token || !d?.id) return;
       const t = await tokenOf(bot);
-      const appId = mod.appIds?.[bot.id] || "0";
-      const base = `/webhooks/${appId}/${d.id}/${d.token}`;
-      const already = mod.ackedInteractions?.has(String(d.id));
-      if (already) mod.ackedInteractions.delete(String(d.id));
-      try {
-        if (!already) await rest(t, "POST", base, { type: 6, flags: 64, loading: true }, signal);
-        await rest(t, "PATCH", base, { data: { content: "\u200b", components: [] }, flags: 64 }, signal).catch(() => {});
-      } catch { /* already responded or interaction token expired */ }
+      const id = String(d.id);
+      const already = mod.ackedInteractions?.has(id);
+      mod.ackedInteractions?.delete(id);
+      if (!already) {
+        await rest(t, "POST", `/interactions/${id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } }, signal)
+          .catch(e => log(ctx, `fallback defer failed id=${id}: ${e?.message || e}`));
+      }
+      let appId = mod.appIds?.[bot.id];
+      if (!appId) {
+        const app = await rest(t, "GET", "/applications/@me").catch(() => null);
+        if (app?.id) { appId = String(app.id); (mod.appIds ||= {})[bot.id] = appId; }
+      }
+      if (!appId) return;
+      await rest(t, "PATCH", `/webhooks/${appId}/${id}/${d.token}/messages/@original`, { content: "\u200b", components: [], flags: 64 }, signal)
+        .catch(e => log(ctx, `placeholder clear failed id=${id}: ${e?.message || e}`));
     },
     async downloadAttachment() { return null; },
     async resolveActorDisplayName(bot, actor) {
@@ -456,15 +467,20 @@ function connectGateway(ctx, mod, bot, token) {
 
   // Discord requires an interaction ACK within 3s, but the host's full pipeline
   // (binding, task RPCs, model lists) can exceed that — so defer immediately on
-  // arrival and clear the spinner later from acknowledgeCallback().
+  // arrival and clear the "is thinking" placeholder later from
+  // acknowledgeCallback(). Per the Discord docs this ACK must go to the
+  // interaction *callback* endpoint (POST /interactions/{id}/{token}/callback);
+  // POSTing to the webhook followup endpoint leaves the placeholder stuck on
+  // "The application did not respond". The response must be type 5
+  // (DEFERRED_CHANNEL_MESSAGE): type 6 is DEFERRED_UPDATE_MESSAGE for components
+  // and does not show/clear a loading state. `loading` lives inside `data`
+  // alongside the EPHEMERAL flag.
   async function quickAck(d) {
     if (!d || !d.id || !d.token) return;
-    const appId = mod.appIds?.[botId];
-    if (!appId) return;
     try {
-      await rest(token, "POST", `/webhooks/${appId}/${d.id}/${d.token}`, { type: 6, flags: 64, loading: true });
+      await rest(token, "POST", `/interactions/${d.id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } });
       (mod.ackedInteractions ||= new Map()).set(String(d.id), Date.now());
-    } catch { /* acknowledgeCallback will retry */ }
+    } catch (e) { log(ctx, `quickAck defer failed id=${d.id}: ${e?.message || e} — slow commands may show "did not respond"`); }
   }
 
   async function welcomeLoop(who) {
@@ -555,6 +571,7 @@ function connectGateway(ctx, mod, bot, token) {
           } else if (t === "MESSAGE_CREATE") {
             handleEvent(ctx, botId, "message", d);
           } else if (t === "INTERACTION_CREATE") {
+            log(ctx, `interaction received id=${d.id} type=${d.type} ${d.data?.name ? "slash /" + d.data.name : d.data?.custom_id ? "component " + String(d.data.custom_id).slice(0, 40) : "?"}`);
             void quickAck(d);
             handleEvent(ctx, botId, "interaction", d);
           }
