@@ -1,0 +1,7 @@
+# runtime state (machine-local, contains secrets/identifiers)
+tokens.json
+dm-channels.json
+commands.json
+gateway.lock
+*.log
+*.tmp
