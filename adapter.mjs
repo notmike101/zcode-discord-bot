@@ -333,36 +333,49 @@ function createProvider(ctx, mod) {
     },
     async acknowledgeCallback(bot, raw, text, reply, signal) {
       // The quick ack on INTERACTION_CREATE deferred the interaction; now that
-      // the answer has been delivered as a channel message, edit the ephemeral
-      // "thinking" placeholder to blank so it disappears. Interaction webhook
-      // routes are TWO segments — /webhooks/{application_id}/{interaction_token}
-      // — the token itself encodes the interaction id; adding an id segment
-      // 404s. The host aborts its own `signal` on a 3s ack budget, but this is
-      // best-effort cleanup after the reply already landed, so use a fresh
-      // short-lived signal instead of inheriting a stale abort.
+      // the answer has landed as a regular channel message, DELETE the
+      // ephemeral "thinking" placeholder. Interaction webhook routes are TWO
+      // segments — /webhooks/{application_id}/{interaction_token} — the token
+      // itself encodes the interaction id; adding an id segment 404s. The host
+      // aborts its own `signal` on a 3s ack budget, but this is best-effort
+      // cleanup after the reply already landed, so use a fresh short-lived
+      // signal instead of inheriting a stale abort.
       const d = raw?.update?.kind === "interaction" ? raw.update.data : null;
       if (!d?.token || !d?.id) return;
       const t = await tokenOf(bot);
       const id = String(d.id);
-      const already = mod.ackedInteractions?.has(id);
-      mod.ackedInteractions?.delete(id);
       const own = AbortSignal.timeout(4000);
-      if (!already) {
+      // Await an in-flight quickAck defer so cleanup never runs before the
+      // placeholder exists; if it failed or never ran, defer here instead.
+      const pending = mod.ackedInteractions?.get(id);
+      mod.ackedInteractions?.delete(id);
+      let deferred = pending ? await pending : false;
+      if (!deferred) {
         await rest(t, "POST", `/interactions/${id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } }, own)
-          .catch(e => {
+          .then(() => { deferred = true; }, e => {
+            // "Unknown interaction" = already responded/deferred (duplicate
+            // delivery raced us), which still leaves a placeholder to delete.
             const m = String(e?.message || e);
-            // "Unknown interaction" = quickAck already deferred this one (race).
-            if (!m.includes("Unknown interaction")) log(ctx, `fallback defer failed id=${id}: ${m}`);
+            if (m.includes("Unknown interaction")) deferred = true;
+            else log(ctx, `fallback defer failed id=${id}: ${m}`);
           });
       }
+      if (!deferred) return;
       let appId = mod.appIds?.[bot.id];
       if (!appId) {
         const app = await rest(t, "GET", "/applications/@me").catch(() => null);
         if (app?.id) { appId = String(app.id); (mod.appIds ||= {})[bot.id] = appId; }
       }
       if (!appId) return;
-      await rest(t, "PATCH", `/webhooks/${appId}/${d.token}/messages/@original`, { content: "\u200b", components: [], flags: 64 }, own)
-        .catch(e => log(ctx, `placeholder clear failed id=${id}: ${e?.message || e}`));
+      // DELETE is the only thing that makes an ephemeral placeholder vanish —
+      // PATCH-to-blank leaves a visible empty "Only you can see this" row.
+      // Safe here because the reply went out through /channels/{id}/messages,
+      // not as an interaction-webhook followup, so the ephemeral delete-cascade
+      // has nothing of ours under this token to take with it. If DELETE fails
+      // (token expires after 15 min), fall back to blanking.
+      await rest(t, "DELETE", `/webhooks/${appId}/${d.token}/messages/@original`, undefined, own)
+        .catch(() => rest(t, "PATCH", `/webhooks/${appId}/${d.token}/messages/@original`, { content: "​", components: [], flags: 64 }, own)
+          .catch(e => log(ctx, `placeholder clear failed id=${id}: ${e?.message || e}`)));
     },
     async downloadAttachment() { return null; },
     async resolveActorDisplayName(bot, actor) {
@@ -488,15 +501,17 @@ function connectGateway(ctx, mod, bot, token) {
   async function quickAck(d) {
     if (!d || !d.id || !d.token) return;
     const k = String(d.id);
-    // mark optimistically so a very fast acknowledgeCallback cannot double-defer;
-    // removed again when the defer actually fails.
-    (mod.ackedInteractions ||= new Map()).set(k, Date.now());
-    try {
-      await rest(token, "POST", `/interactions/${d.id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } });
-    } catch (e) {
-      mod.ackedInteractions?.delete(k);
-      log(ctx, `quickAck defer failed id=${d.id}: ${e?.message || e} — slow commands may show "did not respond"`);
-    }
+    const map = (mod.ackedInteractions ||= new Map());
+    // Track the in-flight defer as a never-rejecting promise resolving to
+    // whether the defer landed, so a very fast acknowledgeCallback can neither
+    // double-defer nor edit/delete the placeholder before the defer exists.
+    const p = rest(token, "POST", `/interactions/${d.id}/${d.token}/callback`, { type: 5, data: { flags: 64, loading: true } }, AbortSignal.timeout(2500))
+      .then(() => true, e => {
+        map.delete(k);
+        log(ctx, `quickAck defer failed id=${d.id}: ${e?.message || e} — slow commands may show "did not respond"`);
+        return false;
+      });
+    map.set(k, p);
   }
 
   async function welcomeLoop(who) {
