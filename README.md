@@ -8,7 +8,7 @@ pipeline (binding, slash commands, permission prompts, sessions) is
 provider-agnostic. Only the adapter + gateway runtime were missing — this repo
 supplies them and flips the UI flag.
 
-> Tested against the ZCode desktop build of Nov 2026, Windows. The patcher
+> Tested against the ZCode desktop build of Nov 2026 3.18.2, Windows. The patcher
 > verifies every anchor before writing and restores cleanly (`--restore`).
 
 ## How it works
