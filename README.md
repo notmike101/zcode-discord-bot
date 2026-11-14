@@ -1,6 +1,6 @@
 # zcode-discord-bot
 
-Drive [ZCode](https://zcode.ai) from your phone through Discord — the same way the
+Drive [ZCode](https://zcode.ai) through Discord — the same way the
 built-in Telegram/Feishu/Weixin bots work. ZCode ships the Discord tile as
 "Coming soon", but the entire provider plumbing already exists inside the app:
 `discord` is a first-class value in the bot schema, and the shared message
